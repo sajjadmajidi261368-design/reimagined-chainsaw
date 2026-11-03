@@ -1,1 +1,204 @@
+name: Build Android APK
 
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build.yml"
+      - "chimikhayi-mobile-updated.zip"
+      - "chimikhayi-mobile-phase1.zip"
+      - "chimikhayi-mobile-fixed.zip"
+      - "*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-apk:
+    name: Build and publish APK artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Extract uploaded project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE=""
+          # Prefer the latest patched archive, while retaining compatibility with earlier uploads.
+          for candidate in chimikhayi-mobile-updated.zip chimikhayi-mobile-fixed.zip chimikhayi-mobile-phase1.zip; do
+            if [[ -f "$candidate" ]] && unzip -Z1 "$candidate" | grep -Eq '(^|/)chimikhayi-mobile/package\.json$'; then
+              ARCHIVE="$candidate"
+              break
+            fi
+          done
+          # Also accept another ZIP filename if it contains the same project folder.
+          if [[ -z "$ARCHIVE" ]]; then
+            while IFS= read -r -d '' candidate; do
+              if unzip -Z1 "$candidate" | grep -Eq '(^|/)chimikhayi-mobile/package\.json$'; then
+                ARCHIVE="$candidate"
+                break
+              fi
+            done < <(find . -maxdepth 1 -type f -name '*.zip' -print0 | sort -z)
+          fi
+          if [[ -z "$ARCHIVE" ]]; then
+            echo "No root ZIP archive containing chimikhayi-mobile/package.json was found." >&2
+            exit 1
+          fi
+          mkdir -p source
+          unzip -oq "$ARCHIVE" -d source
+          test -f source/chimikhayi-mobile/package.json
+          test -f source/chimikhayi-mobile/eas.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/chimikhayi-mobile/package-lock.json
+
+      - name: Set up Expo and EAS CLI
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Install project dependencies
+        working-directory: source/chimikhayi-mobile
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Link or initialize the EAS project
+        working-directory: source/chimikhayi-mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_PROJECT_ID: ${{ vars.EXPO_PROJECT_ID }}
+          EXPO_OWNER: ${{ vars.EXPO_OWNER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const configPath = 'app.json';
+          const app = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+          app.expo ??= {};
+          app.expo.extra ??= {};
+          app.expo.extra.eas ??= {};
+
+          const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+          const configuredId = (process.env.EXPO_PROJECT_ID || '').trim();
+          const configuredOwner = (process.env.EXPO_OWNER || '').trim();
+          const existingId = app.expo.extra.eas.projectId;
+
+          if (configuredId && UUID_RE.test(configuredId)) {
+            app.expo.extra.eas.projectId = configuredId;
+          } else {
+            // Drop placeholder / invalid / missing IDs so eas init can create a fresh project.
+            if (!existingId || existingId === 'REPLACE_WITH_EAS_PROJECT_ID' || !UUID_RE.test(String(existingId))) {
+              delete app.expo.extra.eas.projectId;
+            }
+          }
+
+          // Let --account be the single source of truth while creating a new project.
+          if (!app.expo.extra.eas.projectId && configuredOwner) {
+            delete app.expo.owner;
+          }
+
+          if (Object.keys(app.expo.extra.eas).length === 0) delete app.expo.extra.eas;
+          if (Object.keys(app.expo.extra || {}).length === 0) delete app.expo.extra;
+
+          fs.writeFileSync(configPath, `${JSON.stringify(app, null, 2)}\n`);
+          NODE
+
+          PROJECT_ID="$(node -p "require('./app.json').expo?.extra?.eas?.projectId || ''")"
+
+          if [[ -z "$PROJECT_ID" ]]; then
+            if [[ -z "${EXPO_OWNER:-}" ]]; then
+              echo "Missing GitHub Actions variable EXPO_OWNER." >&2
+              echo "Set it to your Expo account username/team slug," >&2
+              echo "OR set EXPO_PROJECT_ID to an existing EAS project UUID." >&2
+              exit 1
+            fi
+
+            OWNER_SLUG="$(printf '%s' "$EXPO_OWNER" | xargs)"
+            if [[ -z "$OWNER_SLUG" ]]; then
+              echo "EXPO_OWNER is blank. Set it to your Expo account username/team slug." >&2
+              exit 1
+            fi
+
+            echo "No valid projectId found. Running eas init for account: $OWNER_SLUG"
+            eas init --account "$OWNER_SLUG" --non-interactive
+
+            PROJECT_ID="$(node -p "require('./app.json').expo?.extra?.eas?.projectId || ''")"
+
+            # Write owner into app.json for consistency
+            node - "$OWNER_SLUG" <<'NODE'
+          const fs = require('node:fs');
+          const p = 'app.json';
+          const app = JSON.parse(fs.readFileSync(p, 'utf8'));
+          app.expo ??= {};
+          app.expo.owner = process.argv[2];
+          fs.writeFileSync(p, `${JSON.stringify(app, null, 2)}\n`);
+          NODE
+          fi
+
+          if [[ -z "$PROJECT_ID" ]]; then
+            echo "EAS did not return a project ID after init." >&2
+            exit 1
+          fi
+
+          {
+            echo "## EAS project linked"
+            echo "Project ID: \`$PROJECT_ID\`"
+            if [[ -z "${EXPO_PROJECT_ID:-}" ]]; then
+              echo ""
+              echo "Tip: For faster future builds, save this ID as the GitHub Actions variable \`EXPO_PROJECT_ID\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build Android APK on EAS
+        working-directory: source/chimikhayi-mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: eas build --platform android --profile preview --non-interactive --wait
+
+      - name: Download completed APK from EAS
+        working-directory: source/chimikhayi-mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          eas build:list --platform android --build-profile preview --status finished --limit 1 --json > "$RUNNER_TEMP/eas-builds.json"
+          BUILD_URL="$(node - "$RUNNER_TEMP/eas-builds.json" <<'NODE'
+          const fs = require('node:fs');
+          const raw = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          const list = Array.isArray(raw) ? raw : Array.isArray(raw.builds) ? raw.builds : Array.isArray(raw.data) ? raw.data : [raw];
+          const build = list[0];
+          const url = build?.artifacts?.buildUrl;
+          if (!url) {
+            throw new Error('No APK build URL was returned by eas build:list.');
+          }
+          process.stdout.write(url);
+          NODE
+          )"
+          mkdir -p dist
+          curl --fail --location --retry 3 --retry-all-errors --silent --show-error "$BUILD_URL" --output dist/chimikhayi-preview.apk
+          test -s dist/chimikhayi-preview.apk
+          echo "APK downloaded successfully." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK as a GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chimikhayi-android-apk
+          path: source/chimikhayi-mobile/dist/chimikhayi-preview.apk
+          if-no-files-found: error
+          retention-days: 14
